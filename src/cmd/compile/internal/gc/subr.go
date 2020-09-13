@@ -60,9 +60,15 @@ func adderrorname(n *Node) {
 }
 
 func adderr(pos src.XPos, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	// Only add the position if know the position.
+	// See issue golang.org/issue/11361.
+	if pos.IsKnown() {
+		msg = fmt.Sprintf("%v: %s", linestr(pos), msg)
+	}
 	errors = append(errors, Error{
 		pos: pos,
-		msg: fmt.Sprintf("%v: %s\n", linestr(pos), fmt.Sprintf(format, args...)),
+		msg: msg + "\n",
 	})
 }
 
@@ -154,14 +160,17 @@ func yyerrorl(pos src.XPos, format string, args ...interface{}) {
 	}
 }
 
+func yyerrorv(lang string, format string, args ...interface{}) {
+	what := fmt.Sprintf(format, args...)
+	yyerrorl(lineno, "%s requires %s or later (-lang was set to %s; check go.mod)", what, lang, flag_lang)
+}
+
 func yyerror(format string, args ...interface{}) {
 	yyerrorl(lineno, format, args...)
 }
 
 func Warn(fmt_ string, args ...interface{}) {
-	adderr(lineno, fmt_, args...)
-
-	hcrash()
+	Warnl(lineno, fmt_, args...)
 }
 
 func Warnl(line src.XPos, fmt_ string, args ...interface{}) {
@@ -196,30 +205,37 @@ func Fatalf(fmt_ string, args ...interface{}) {
 	errorexit()
 }
 
-func setlineno(n *Node) src.XPos {
-	lno := lineno
-	if n != nil {
-		switch n.Op {
-		case ONAME, OPACK:
-			break
-
-		case OLITERAL, OTYPE:
-			if n.Sym != nil {
-				break
-			}
-			fallthrough
-
-		default:
-			lineno = n.Pos
-			if !lineno.IsKnown() {
-				if Debug['K'] != 0 {
-					Warn("setlineno: unknown position (line 0)")
-				}
-				lineno = lno
-			}
+// hasUniquePos reports whether n has a unique position that can be
+// used for reporting error messages.
+//
+// It's primarily used to distinguish references to named objects,
+// whose Pos will point back to their declaration position rather than
+// their usage position.
+func hasUniquePos(n *Node) bool {
+	switch n.Op {
+	case ONAME, OPACK:
+		return false
+	case OLITERAL, OTYPE:
+		if n.Sym != nil {
+			return false
 		}
 	}
 
+	if !n.Pos.IsKnown() {
+		if Debug['K'] != 0 {
+			Warn("setlineno: unknown position (line 0)")
+		}
+		return false
+	}
+
+	return true
+}
+
+func setlineno(n *Node) src.XPos {
+	lno := lineno
+	if n != nil && hasUniquePos(n) {
+		lineno = n.Pos
+	}
 	return lno
 }
 
@@ -253,13 +269,6 @@ func autolabel(prefix string) *types.Sym {
 	n := fn.Func.Label
 	fn.Func.Label++
 	return lookupN(prefix, int(n))
-}
-
-func restrictlookup(name string, pkg *types.Pkg) *types.Sym {
-	if !types.IsExported(name) && pkg != localpkg {
-		yyerror("cannot refer to unexported name %s.%s", pkg.Name, name)
-	}
-	return pkg.Lookup(name)
 }
 
 // find all the exported symbols in package opkg
@@ -306,20 +315,20 @@ func nodl(pos src.XPos, op Op, nleft, nright *Node) *Node {
 	switch op {
 	case OCLOSURE, ODCLFUNC:
 		var x struct {
-			Node
-			Func
+			n Node
+			f Func
 		}
-		n = &x.Node
-		n.Func = &x.Func
+		n = &x.n
+		n.Func = &x.f
 	case ONAME:
 		Fatalf("use newname instead")
 	case OLABEL, OPACK:
 		var x struct {
-			Node
-			Name
+			n Node
+			m Name
 		}
-		n = &x.Node
-		n.Name = &x.Name
+		n = &x.n
+		n.Name = &x.m
 	default:
 		n = new(Node)
 	}
@@ -347,27 +356,32 @@ func newnamel(pos src.XPos, s *types.Sym) *Node {
 	}
 
 	var x struct {
-		Node
-		Name
-		Param
+		n Node
+		m Name
+		p Param
 	}
-	n := &x.Node
-	n.Name = &x.Name
-	n.Name.Param = &x.Param
+	n := &x.n
+	n.Name = &x.m
+	n.Name.Param = &x.p
 
 	n.Op = ONAME
 	n.Pos = pos
 	n.Orig = n
 
 	n.Sym = s
-	n.SetAddable(true)
 	return n
 }
 
 // nodSym makes a Node with Op op and with the Left field set to left
 // and the Sym field set to sym. This is for ODOT and friends.
 func nodSym(op Op, left *Node, sym *types.Sym) *Node {
-	n := nod(op, left, nil)
+	return nodlSym(lineno, op, left, sym)
+}
+
+// nodlSym makes a Node with position Pos, with Op op, and with the Left field set to left
+// and the Sym field set to sym. This is for ODOT and friends.
+func nodlSym(pos src.XPos, op Op, left *Node, sym *types.Sym) *Node {
+	n := nodl(pos, op, left, nil)
 	n.Sym = sym
 	return n
 }
@@ -416,12 +430,6 @@ func nodintconst(v int64) *Node {
 	return nodlit(Val{u})
 }
 
-func nodfltconst(v *Mpflt) *Node {
-	u := newMpflt()
-	u.Set(v)
-	return nodlit(Val{u})
-}
-
 func nodnil() *Node {
 	return nodlit(Val{new(NilVal)})
 }
@@ -435,10 +443,9 @@ func nodstr(s string) *Node {
 }
 
 // treecopy recursively copies n, with the exception of
-// ONAME, OLITERAL, OTYPE, and non-iota ONONAME leaves.
-// Copies of iota ONONAME nodes are assigned the current
-// value of iota_. If pos.IsKnown(), it sets the source
-// position of newly allocated nodes to pos.
+// ONAME, OLITERAL, OTYPE, and ONONAME leaves.
+// If pos.IsKnown(), it sets the source position of newly
+// allocated nodes to pos.
 func treecopy(n *Node, pos src.XPos) *Node {
 	if n == nil {
 		return nil
@@ -539,8 +546,8 @@ func methtype(t *types.Type) *types.Type {
 
 // Is type src assignment compatible to type dst?
 // If so, return op code to use in conversion.
-// If not, return 0.
-func assignop(src *types.Type, dst *types.Type, why *string) Op {
+// If not, return OXXX.
+func assignop(src, dst *types.Type, why *string) Op {
 	if why != nil {
 		*why = ""
 	}
@@ -549,7 +556,7 @@ func assignop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONVNOP
 	}
 	if src == nil || dst == nil || src.Etype == TFORW || dst.Etype == TFORW || src.Orig == nil || dst.Orig == nil {
-		return 0
+		return OXXX
 	}
 
 	// 1. src type is identical to dst.
@@ -609,14 +616,14 @@ func assignop(src *types.Type, dst *types.Type, why *string) Op {
 			}
 		}
 
-		return 0
+		return OXXX
 	}
 
 	if isptrto(dst, TINTER) {
 		if why != nil {
 			*why = fmt.Sprintf(":\n\t%v is pointer to interface, not interface", dst)
 		}
-		return 0
+		return OXXX
 	}
 
 	if src.IsInterface() && dst.Etype != TBLANK {
@@ -625,7 +632,7 @@ func assignop(src *types.Type, dst *types.Type, why *string) Op {
 		if why != nil && implements(dst, src, &missing, &have, &ptr) {
 			*why = ": need type assertion"
 		}
-		return 0
+		return OXXX
 	}
 
 	// 4. src is a bidirectional channel value, dst is a channel type,
@@ -657,13 +664,14 @@ func assignop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONVNOP
 	}
 
-	return 0
+	return OXXX
 }
 
 // Can we convert a value of type src to a value of type dst?
 // If so, return op code to use in conversion (maybe OCONVNOP).
-// If not, return 0.
-func convertop(src *types.Type, dst *types.Type, why *string) Op {
+// If not, return OXXX.
+// srcConstant indicates whether the value of type src is a constant.
+func convertop(srcConstant bool, src, dst *types.Type, why *string) Op {
 	if why != nil {
 		*why = ""
 	}
@@ -672,7 +680,7 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONVNOP
 	}
 	if src == nil || dst == nil {
-		return 0
+		return OXXX
 	}
 
 	// Conversions from regular to go:notinheap are not allowed
@@ -683,19 +691,19 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 		if why != nil {
 			*why = fmt.Sprintf(":\n\t%v is go:notinheap, but %v is not", dst.Elem(), src.Elem())
 		}
-		return 0
+		return OXXX
 	}
 	// (b) Disallow string to []T where T is go:notinheap.
 	if src.IsString() && dst.IsSlice() && dst.Elem().NotInHeap() && (dst.Elem().Etype == types.Bytetype.Etype || dst.Elem().Etype == types.Runetype.Etype) {
 		if why != nil {
 			*why = fmt.Sprintf(":\n\t%v is go:notinheap", dst.Elem())
 		}
-		return 0
+		return OXXX
 	}
 
 	// 1. src can be assigned to dst.
 	op := assignop(src, dst, why)
-	if op != 0 {
+	if op != OXXX {
 		return op
 	}
 
@@ -704,7 +712,7 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 	// with the good message from assignop.
 	// Otherwise clear the error.
 	if src.IsInterface() || dst.IsInterface() {
-		return 0
+		return OXXX
 	}
 	if why != nil {
 		*why = ""
@@ -739,6 +747,13 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONV
 	}
 
+	// Special case for constant conversions: any numeric
+	// conversion is potentially okay. We'll validate further
+	// within evconst. See #38117.
+	if srcConstant && (src.IsInteger() || src.IsFloat() || src.IsComplex()) && (dst.IsInteger() || dst.IsFloat() || dst.IsComplex()) {
+		return OCONV
+	}
+
 	// 6. src is an integer or has type []byte or []rune
 	// and dst is a string type.
 	if src.IsInteger() && dst.IsString() {
@@ -766,12 +781,12 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 	}
 
 	// 8. src is a pointer or uintptr and dst is unsafe.Pointer.
-	if (src.IsPtr() || src.Etype == TUINTPTR) && dst.Etype == TUNSAFEPTR {
+	if (src.IsPtr() || src.IsUintptr()) && dst.IsUnsafePtr() {
 		return OCONVNOP
 	}
 
 	// 9. src is unsafe.Pointer and dst is a pointer or uintptr.
-	if src.Etype == TUNSAFEPTR && (dst.IsPtr() || dst.Etype == TUINTPTR) {
+	if src.IsUnsafePtr() && (dst.IsPtr() || dst.IsUintptr()) {
 		return OCONVNOP
 	}
 
@@ -783,7 +798,7 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONVNOP
 	}
 
-	return 0
+	return OXXX
 }
 
 func assignconv(n *Node, t *types.Type, context string) *Node {
@@ -800,11 +815,10 @@ func assignconvfn(n *Node, t *types.Type, context func() string) *Node {
 		yyerror("use of untyped nil")
 	}
 
-	old := n
-	od := old.Diag()
-	old.SetDiag(true) // silence errors about n; we'll issue one below
-	n = defaultlit(n, t)
-	old.SetDiag(od)
+	n = convlit1(n, t, false, context)
+	if n.Type == nil {
+		return n
+	}
 	if t.Etype == TBLANK {
 		return n
 	}
@@ -827,10 +841,8 @@ func assignconvfn(n *Node, t *types.Type, context func() string) *Node {
 
 	var why string
 	op := assignop(n.Type, t, &why)
-	if op == 0 {
-		if !old.Diag() {
-			yyerror("cannot use %L as type %v in %s%s", n, t, context(), why)
-		}
+	if op == OXXX {
+		yyerror("cannot use %L as type %v in %s%s", n, t, context(), why)
 		op = OCONV
 	}
 
@@ -914,6 +926,21 @@ func (o Op) IsSlice3() bool {
 	}
 	Fatalf("IsSlice3 op %v", o)
 	return false
+}
+
+// slicePtrLen extracts the pointer and length from a slice.
+// This constructs two nodes referring to n, so n must be a cheapexpr.
+func (n *Node) slicePtrLen() (ptr, len *Node) {
+	var init Nodes
+	c := cheapexpr(n, &init)
+	if c != n || init.Len() != 0 {
+		Fatalf("slicePtrLen not cheap: %v", n)
+	}
+	ptr = nod(OSPTR, n, nil)
+	ptr.Type = n.Type.Elem().PtrTo()
+	len = nod(OLEN, n, nil)
+	len.Type = types.Types[TINT]
+	return ptr, len
 }
 
 // labeledControl returns the control flow Node (for, switch, select)
@@ -1189,7 +1216,12 @@ func lookdot0(s *types.Sym, t *types.Type, save **types.Field, ignorecase bool) 
 		}
 	}
 
-	u = methtype(t)
+	u = t
+	if t.Sym != nil && t.IsPtr() && !t.Elem().IsPtr() {
+		// If t is a defined pointer type, then x.m is shorthand for (*x).m.
+		u = t.Elem()
+	}
+	u = methtype(u)
 	if u != nil {
 		for _, f := range u.Methods().Slice() {
 			if f.Embedded == 0 && (f.Sym == s || (ignorecase && strings.EqualFold(f.Sym.Name, s.Name))) {
@@ -1288,7 +1320,7 @@ func dotpath(s *types.Sym, t *types.Type, save **types.Field, ignorecase bool) (
 // will give shortest unique addressing.
 // modify the tree with missing type names.
 func adddot(n *Node) *Node {
-	n.Left = typecheck(n.Left, Etype|ctxExpr)
+	n.Left = typecheck(n.Left, ctxType|ctxExpr)
 	if n.Left.Diag() {
 		n.SetDiag(true)
 	}
@@ -1511,7 +1543,6 @@ func genwrapper(rcvr *types.Type, method *types.Field, newnam *types.Sym) {
 	tfn.List.Set(structargs(method.Type.Params(), true))
 	tfn.Rlist.Set(structargs(method.Type.Results(), false))
 
-	disableExport(newnam)
 	fn := dclfunc(newnam, tfn)
 	fn.Func.SetDupok(true)
 
@@ -1581,7 +1612,7 @@ func genwrapper(rcvr *types.Type, method *types.Field, newnam *types.Sym) {
 	if rcvr.IsPtr() && rcvr.Elem() == method.Type.Recv().Type && rcvr.Elem().Sym != nil {
 		inlcalls(fn)
 	}
-	escAnalyze([]*Node{fn}, false)
+	escapeFuncs([]*Node{fn}, false)
 
 	Curfn = nil
 	funccompile(fn)
@@ -1599,8 +1630,7 @@ func hashmem(t *types.Type) *Node {
 	sym := Runtimepkg.Lookup("memhash")
 
 	n := newname(sym)
-	n.SetClass(PFUNC)
-	n.Sym.SetFunc(true)
+	setNodeNameFunc(n)
 	n.Type = functype(nil, []*Node{
 		anonfield(types.NewPtr(t)),
 		anonfield(types.Types[TUINTPTR]),
@@ -1869,18 +1899,21 @@ func itabType(itab *Node) *Node {
 // ifaceData loads the data field from an interface.
 // The concrete type must be known to have type t.
 // It follows the pointer if !isdirectiface(t).
-func ifaceData(n *Node, t *types.Type) *Node {
-	ptr := nodSym(OIDATA, n, nil)
+func ifaceData(pos src.XPos, n *Node, t *types.Type) *Node {
+	if t.IsInterface() {
+		Fatalf("ifaceData interface: %v", t)
+	}
+	ptr := nodlSym(pos, OIDATA, n, nil)
 	if isdirectiface(t) {
 		ptr.Type = t
 		ptr.SetTypecheck(1)
 		return ptr
 	}
 	ptr.Type = types.NewPtr(t)
-	ptr.SetBounded(true)
 	ptr.SetTypecheck(1)
-	ind := nod(ODEREF, ptr, nil)
+	ind := nodl(pos, ODEREF, ptr, nil)
 	ind.Type = t
 	ind.SetTypecheck(1)
+	ind.SetBounded(true)
 	return ind
 }

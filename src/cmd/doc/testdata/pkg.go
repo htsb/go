@@ -35,6 +35,8 @@ const (
 // Comment about exported variable.
 var ExportedVariable = 1
 
+var ExportedVarOfUnExported unexportedType
+
 // Comment about internal variable.
 var internalVariable = 2
 
@@ -77,6 +79,10 @@ type ExportedType struct {
 
 // Comment about exported method.
 func (ExportedType) ExportedMethod(a int) bool {
+	return true != true
+}
+
+func (ExportedType) Uncommented(a int) bool {
 	return true != true
 }
 
@@ -203,3 +209,25 @@ const (
 	Duplicate = iota
 	duplicate
 )
+
+// Comment about exported function with formatting.
+//
+// Example
+//
+//	fmt.Println(FormattedDoc())
+//
+// Text after pre-formatted block.
+func ExportedFormattedDoc(a int) bool {
+	return true
+}
+
+type ExportedFormattedType struct {
+	// Comment before exported field with formatting.
+	//
+	// Example
+	//
+	//	a.ExportedField = 123
+	//
+	// Text after pre-formatted block.
+	ExportedField int
+}

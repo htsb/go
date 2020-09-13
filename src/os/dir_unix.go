@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin,!arm,!arm64 dragonfly freebsd js,wasm linux nacl netbsd openbsd solaris
+// +build aix dragonfly freebsd js,wasm linux netbsd openbsd solaris
 
 package os
 
@@ -50,7 +50,7 @@ func (f *File) readdirnames(n int) (names []string, err error) {
 			d.nbuf, errno = f.pfd.ReadDirent(d.buf)
 			runtime.KeepAlive(f)
 			if errno != nil {
-				return names, wrapSyscallError("readdirent", errno)
+				return names, &PathError{"readdirent", f.name, errno}
 			}
 			if d.nbuf <= 0 {
 				break // EOF

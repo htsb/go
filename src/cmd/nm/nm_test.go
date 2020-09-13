@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"internal/obscuretestdata"
 	"internal/testenv"
 	"io/ioutil"
 	"os"
@@ -57,8 +58,8 @@ func TestNonGoExecs(t *testing.T) {
 	testfiles := []string{
 		"debug/elf/testdata/gcc-386-freebsd-exec",
 		"debug/elf/testdata/gcc-amd64-linux-exec",
-		"debug/macho/testdata/gcc-386-darwin-exec",
-		"debug/macho/testdata/gcc-amd64-darwin-exec",
+		"debug/macho/testdata/gcc-386-darwin-exec.base64",   // golang.org/issue/34986
+		"debug/macho/testdata/gcc-amd64-darwin-exec.base64", // golang.org/issue/34986
 		// "debug/pe/testdata/gcc-amd64-mingw-exec", // no symbols!
 		"debug/pe/testdata/gcc-386-mingw-exec",
 		"debug/plan9obj/testdata/amd64-plan9-exec",
@@ -67,6 +68,16 @@ func TestNonGoExecs(t *testing.T) {
 	}
 	for _, f := range testfiles {
 		exepath := filepath.Join(runtime.GOROOT(), "src", f)
+		if strings.HasSuffix(f, ".base64") {
+			tf, err := obscuretestdata.DecodeToTempFile(exepath)
+			if err != nil {
+				t.Errorf("obscuretestdata.DecodeToTempFile(%s): %v", exepath, err)
+				continue
+			}
+			defer os.Remove(tf)
+			exepath = tf
+		}
+
 		cmd := exec.Command(testnmpath, exepath)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -136,6 +147,11 @@ func testGoExec(t *testing.T, iscgo, isexternallinker bool) {
 		"runtime.noptrdata": "D",
 	}
 
+	if runtime.GOOS == "aix" && iscgo {
+		// pclntab is moved to .data section on AIX.
+		runtimeSyms["runtime.epclntab"] = "D"
+	}
+
 	out, err = exec.Command(testnmpath, exe).CombinedOutput()
 	if err != nil {
 		t.Fatalf("go tool nm: %v\n%s", err, string(out))
@@ -146,12 +162,15 @@ func testGoExec(t *testing.T, iscgo, isexternallinker bool) {
 			// On AIX, .data and .bss addresses are changed by the loader.
 			// Therefore, the values returned by the exec aren't the same
 			// than the ones inside the symbol table.
+			// In case of cgo, .text symbols are also changed.
 			switch code {
+			case "T", "t", "R", "r":
+				return iscgo
 			case "D", "d", "B", "b":
 				return true
 			}
 		}
-		if runtime.GOOS == "windows" && runtime.GOARCH == "arm" {
+		if runtime.GOOS == "windows" {
 			return true
 		}
 		return false
@@ -258,15 +277,18 @@ func testGoLib(t *testing.T, iscgo bool) {
 		Found bool
 	}
 	var syms = []symType{
-		{"B", "%22%22.Testdata", false, false},
-		{"T", "%22%22.Testfunc", false, false},
+		{"B", "mylib.Testdata", false, false},
+		{"T", "mylib.Testfunc", false, false},
 	}
 	if iscgo {
-		syms = append(syms, symType{"B", "%22%22.TestCgodata", false, false})
-		syms = append(syms, symType{"T", "%22%22.TestCgofunc", false, false})
+		syms = append(syms, symType{"B", "mylib.TestCgodata", false, false})
+		syms = append(syms, symType{"T", "mylib.TestCgofunc", false, false})
 		if runtime.GOOS == "darwin" || (runtime.GOOS == "windows" && runtime.GOARCH == "386") {
 			syms = append(syms, symType{"D", "_cgodata", true, false})
 			syms = append(syms, symType{"T", "_cgofunc", true, false})
+		} else if runtime.GOOS == "aix" {
+			syms = append(syms, symType{"D", "cgodata", true, false})
+			syms = append(syms, symType{"T", ".cgofunc", true, false})
 		} else {
 			syms = append(syms, symType{"D", "cgodata", true, false})
 			syms = append(syms, symType{"T", "cgofunc", true, false})

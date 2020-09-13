@@ -19,9 +19,10 @@ import (
 // can overwrite this data, which could cause the finalizer
 // to close the wrong file descriptor.
 type file struct {
-	pfd     poll.FD
-	name    string
-	dirinfo *dirInfo // nil unless directory being read
+	pfd        poll.FD
+	name       string
+	dirinfo    *dirInfo // nil unless directory being read
+	appendMode bool     // whether file is opened for appending
 }
 
 // Fd returns the Windows handle referencing the open file.
@@ -41,6 +42,9 @@ func newFile(h syscall.Handle, name string, kind string) *File {
 		var m uint32
 		if syscall.GetConsoleMode(h, &m) == nil {
 			kind = "console"
+		}
+		if t, err := syscall.GetFileType(h); err == nil && t == syscall.FILE_TYPE_PIPE {
+			kind = "pipe"
 		}
 	}
 
@@ -107,10 +111,17 @@ func openDir(name string) (file *File, err error) {
 
 	path := fixLongPath(name)
 
-	if len(path) == 2 && path[1] == ':' || (len(path) > 0 && path[len(path)-1] == '\\') { // it is a drive letter, like C:
+	if len(path) == 2 && path[1] == ':' { // it is a drive letter, like C:
 		mask = path + `*`
+	} else if len(path) > 0 {
+		lc := path[len(path)-1]
+		if lc == '/' || lc == '\\' {
+			mask = path + `*`
+		} else {
+			mask = path + `\*`
+		}
 	} else {
-		mask = path + `\*`
+		mask = `\*`
 	}
 	maskp, e := syscall.UTF16PtrFromString(mask)
 	if e != nil {
@@ -171,16 +182,6 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	return nil, &PathError{"open", name, errf}
 }
 
-// Close closes the File, rendering it unusable for I/O.
-// On files that support SetDeadline, any pending I/O operations will
-// be canceled and return immediately with an error.
-func (file *File) Close() error {
-	if file == nil {
-		return ErrInvalid
-	}
-	return file.file.close()
-}
-
 func (file *file) close() error {
 	if file == nil {
 		return syscall.EINVAL
@@ -200,39 +201,6 @@ func (file *file) close() error {
 	// no need for a finalizer anymore
 	runtime.SetFinalizer(file, nil)
 	return err
-}
-
-// read reads up to len(b) bytes from the File.
-// It returns the number of bytes read and an error, if any.
-func (f *File) read(b []byte) (n int, err error) {
-	n, err = f.pfd.Read(b)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// pread reads len(b) bytes from the File starting at byte offset off.
-// It returns the number of bytes read and the error, if any.
-// EOF is signaled by a zero count with err set to 0.
-func (f *File) pread(b []byte, off int64) (n int, err error) {
-	n, err = f.pfd.Pread(b, off)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// write writes len(b) bytes to the File.
-// It returns the number of bytes written and an error, if any.
-func (f *File) write(b []byte) (n int, err error) {
-	n, err = f.pfd.Write(b)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// pwrite writes len(b) bytes to the File starting at byte offset off.
-// It returns the number of bytes written and an error, if any.
-func (f *File) pwrite(b []byte, off int64) (n int, err error) {
-	n, err = f.pfd.Pwrite(b, off)
-	runtime.KeepAlive(f)
-	return n, err
 }
 
 // seek sets the offset for the next Read or Write on file to offset, interpreted
@@ -315,7 +283,7 @@ func Pipe() (r *File, w *File, err error) {
 	if e != nil {
 		return nil, nil, NewSyscallError("pipe", e)
 	}
-	return newFile(p[0], "|0", "file"), newFile(p[1], "|1", "file"), nil
+	return newFile(p[0], "|0", "pipe"), newFile(p[1], "|1", "pipe"), nil
 }
 
 func tempDir() string {
@@ -362,8 +330,18 @@ func Symlink(oldname, newname string) error {
 
 	// need the exact location of the oldname when it's relative to determine if it's a directory
 	destpath := oldname
-	if !isAbs(oldname) {
-		destpath = dirname(newname) + `\` + oldname
+	if v := volumeName(oldname); v == "" {
+		if len(oldname) > 0 && IsPathSeparator(oldname[0]) {
+			// oldname is relative to the volume containing newname.
+			if v = volumeName(newname); v != "" {
+				// Prepend the volume explicitly, because it may be different from the
+				// volume of the current working directory.
+				destpath = v + oldname
+			}
+		} else {
+			// oldname is relative to newname.
+			destpath = dirname(newname) + `\` + oldname
+		}
 	}
 
 	fi, err := Stat(destpath)

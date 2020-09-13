@@ -624,7 +624,7 @@ if it has already been declared, provided:
 <li>this declaration is in the same scope as the existing declaration of <code>v</code>
 (if <code>v</code> is already declared in an outer scope, the declaration will create a new variable §),</li>
 <li>the corresponding value in the initialization is assignable to <code>v</code>, and</li>
-<li>there is at least one other variable in the declaration that is being declared anew.</li>
+<li>there is at least one other variable that is created by the declaration.</li>
 </ul>
 
 <p>
@@ -1680,13 +1680,15 @@ maps.  Here is a print statement for the time zone map defined in the previous s
 fmt.Printf("%v\n", timeZone)  // or just fmt.Println(timeZone)
 </pre>
 <p>
-which gives output
+which gives output:
 </p>
 <pre>
-map[CST:-21600 PST:-28800 EST:-18000 UTC:0 MST:-25200]
+map[CST:-21600 EST:-18000 MST:-25200 PST:-28800 UTC:0]
 </pre>
 <p>
-For maps the keys may be output in any order, of course.
+For maps, <code>Printf</code> and friends sort the output lexicographically by key.
+</p>
+<p>
 When printing a struct, the modified format <code>%+v</code> annotates the
 fields of the structure with their names, and for any value the alternate
 format <code>%#v</code> prints the value in full Go syntax.
@@ -1710,7 +1712,7 @@ prints
 &amp;{7 -2.35 abc   def}
 &amp;{a:7 b:-2.35 c:abc     def}
 &amp;main.T{a:7, b:-2.35, c:"abc\tdef"}
-map[string]int{"CST":-21600, "PST":-28800, "EST":-18000, "UTC":0, "MST":-25200}
+map[string]int{"CST":-21600, "EST":-18000, "MST":-25200, "PST":-28800, "UTC":0}
 </pre>
 <p>
 (Note the ampersands.)
@@ -2280,8 +2282,8 @@ The  <code>crypto/cipher</code> interfaces look like this:
 <pre>
 type Block interface {
     BlockSize() int
-    Encrypt(src, dst []byte)
-    Decrypt(src, dst []byte)
+    Encrypt(dst, src []byte)
+    Decrypt(dst, src []byte)
 }
 
 type Stream interface {
@@ -2334,10 +2336,9 @@ of the request from the client.
 </p>
 <p>
 For brevity, let's ignore POSTs and assume HTTP requests are always
-GETs; that simplification does not affect the way the handlers are
-set up.  Here's a trivial but complete implementation of a handler to
-count the number of times the
-page is visited.
+GETs; that simplification does not affect the way the handlers are set up.
+Here's a trivial implementation of a handler to count the number of times
+the page is visited.
 </p>
 <pre>
 // Simple counter server.
@@ -2353,6 +2354,11 @@ func (ctr *Counter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 <p>
 (Keeping with our theme, note how <code>Fprintf</code> can print to an
 <code>http.ResponseWriter</code>.)
+In a real server, access to <code>ctr.n</code> would need protection from
+concurrent access.
+See the <code>sync</code> and <code>atomic</code> packages for suggestions.
+</p>
+<p>
 For reference, here's how to attach such a server to a node on the URL tree.
 </p>
 <pre>
@@ -2693,8 +2699,7 @@ type ReadWriter interface {
 <p>
 This says just what it looks like: A <code>ReadWriter</code> can do
 what a <code>Reader</code> does <em>and</em> what a <code>Writer</code>
-does; it is a union of the embedded interfaces (which must be disjoint
-sets of methods).
+does; it is a union of the embedded interfaces.
 Only interfaces can be embedded within interfaces.
 </p>
 <p>

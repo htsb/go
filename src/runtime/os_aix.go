@@ -97,6 +97,66 @@ func osinit() {
 	setupSystemConf()
 }
 
+// newosproc0 is a version of newosproc that can be called before the runtime
+// is initialized.
+//
+// This function is not safe to use after initialization as it does not pass an M as fnarg.
+//
+//go:nosplit
+func newosproc0(stacksize uintptr, fn *funcDescriptor) {
+	var (
+		attr pthread_attr
+		oset sigset
+		tid  pthread
+	)
+
+	if pthread_attr_init(&attr) != 0 {
+		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		exit(1)
+	}
+
+	if pthread_attr_setstacksize(&attr, threadStackSize) != 0 {
+		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		exit(1)
+	}
+
+	if pthread_attr_setdetachstate(&attr, _PTHREAD_CREATE_DETACHED) != 0 {
+		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		exit(1)
+	}
+
+	// Disable signals during create, so that the new thread starts
+	// with signals disabled. It will enable them in minit.
+	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	var ret int32
+	for tries := 0; tries < 20; tries++ {
+		// pthread_create can fail with EAGAIN for no reasons
+		// but it will be ok if it retries.
+		ret = pthread_create(&tid, &attr, fn, nil)
+		if ret != _EAGAIN {
+			break
+		}
+		usleep(uint32(tries+1) * 1000) // Milliseconds.
+	}
+	sigprocmask(_SIG_SETMASK, &oset, nil)
+	if ret != 0 {
+		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		exit(1)
+	}
+
+}
+
+var failthreadcreate = []byte("runtime: failed to create new OS thread\n")
+
+// Called to do synchronous initialization of Go code built with
+// -buildmode=c-archive or -buildmode=c-shared.
+// None of the Go runtime is initialized.
+//go:nosplit
+//go:nowritebarrierrec
+func libpreinit() {
+	initsig(true)
+}
+
 // Ms related functions
 func mpreinit(mp *m) {
 	mp.gsignal = malg(32 * 1024) // AIX wants >= 8K
@@ -115,6 +175,7 @@ func miniterrno() {
 func minit() {
 	miniterrno()
 	minitSignals()
+	getg().m.procid = uint64(pthread_self())
 }
 
 func unminit() {
@@ -213,7 +274,13 @@ func setsig(i uint32, fn uintptr) {
 //go:nosplit
 //go:nowritebarrierrec
 func setsigstack(i uint32) {
-	throw("Not yet implemented\n")
+	var sa sigactiont
+	sigaction(uintptr(i), nil, &sa)
+	if sa.sa_flags&_SA_ONSTACK != 0 {
+		return
+	}
+	sa.sa_flags |= _SA_ONSTACK
+	sigaction(uintptr(i), &sa, nil)
 }
 
 //go:nosplit
@@ -230,9 +297,19 @@ func setSignalstackSP(s *stackt, sp uintptr) {
 	*(*uintptr)(unsafe.Pointer(&s.ss_sp)) = sp
 }
 
+//go:nosplit
 func (c *sigctxt) fixsigcode(sig uint32) {
+	switch sig {
+	case _SIGPIPE:
+		// For SIGPIPE, c.sigcode() isn't set to _SI_USER as on Linux.
+		// Therefore, raisebadsignal won't raise SIGPIPE again if
+		// it was deliver in a non-Go thread.
+		c.set_sigcode(_SI_USER)
+	}
 }
 
+//go:nosplit
+//go:nowritebarrierrec
 func sigaddset(mask *sigset, i int) {
 	(*mask)[(i-1)/64] |= 1 << ((uint32(i) - 1) & 63)
 }
@@ -247,7 +324,7 @@ const (
 )
 
 //go:nosplit
-func nanotime() int64 {
+func nanotime1() int64 {
 	tp := &timespec{}
 	if clock_gettime(_CLOCK_REALTIME, tp) != 0 {
 		throw("syscall clock_gettime failed")
@@ -255,7 +332,7 @@ func nanotime() int64 {
 	return tp.tv_sec*1000000000 + tp.tv_nsec
 }
 
-func walltime() (sec int64, nsec int32) {
+func walltime1() (sec int64, nsec int32) {
 	ts := &timespec{}
 	if clock_gettime(_CLOCK_REALTIME, ts) != 0 {
 		throw("syscall clock_gettime failed")
@@ -280,4 +357,21 @@ func setupSystemConf() {
 	if impl&_IMPL_POWER9 != 0 {
 		cpu.HWCap2 |= cpu.PPC_FEATURE2_ARCH_3_00
 	}
+}
+
+//go:nosplit
+func fcntl(fd, cmd, arg int32) int32 {
+	r, _ := syscall3(&libc_fcntl, uintptr(fd), uintptr(cmd), uintptr(arg))
+	return int32(r)
+}
+
+//go:nosplit
+func closeonexec(fd int32) {
+	fcntl(fd, _F_SETFD, _FD_CLOEXEC)
+}
+
+//go:nosplit
+func setNonblock(fd int32) {
+	flags := fcntl(fd, _F_GETFL, 0)
+	fcntl(fd, _F_SETFL, flags|_O_NONBLOCK)
 }

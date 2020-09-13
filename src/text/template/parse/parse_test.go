@@ -244,6 +244,7 @@ var parseTests = []parseTest{
 	{"trim left", "x \r\n\t{{- 3}}", noError, `"x"{{3}}`},
 	{"trim right", "{{3 -}}\n\n\ty", noError, `{{3}}"y"`},
 	{"trim left and right", "x \r\n\t{{- 3 -}}\n\n\ty", noError, `"x"{{3}}"y"`},
+	{"trim with extra spaces", "x\n{{-  3   -}}\ny", noError, `"x"{{3}}"y"`},
 	{"comment trim left", "x \r\n\t{{- /* hi */}}", noError, `"x"`},
 	{"comment trim right", "{{/* hi */ -}}\n\n\ty", noError, `"y"`},
 	{"comment trim left and right", "x \r\n\t{{- /* */ -}}\n\n\ty", noError, `"x""y"`},
@@ -303,7 +304,8 @@ var parseTests = []parseTest{
 }
 
 var builtins = map[string]interface{}{
-	"printf": fmt.Sprintf,
+	"printf":   fmt.Sprintf,
+	"contains": strings.Contains,
 }
 
 func testParse(doCopy bool, t *testing.T) {
@@ -346,6 +348,30 @@ func TestParseCopy(t *testing.T) {
 	testParse(true, t)
 }
 
+func TestParseWithComments(t *testing.T) {
+	textFormat = "%q"
+	defer func() { textFormat = "%s" }()
+	tests := [...]parseTest{
+		{"comment", "{{/*\n\n\n*/}}", noError, "{{/*\n\n\n*/}}"},
+		{"comment trim left", "x \r\n\t{{- /* hi */}}", noError, `"x"{{/* hi */}}`},
+		{"comment trim right", "{{/* hi */ -}}\n\n\ty", noError, `{{/* hi */}}"y"`},
+		{"comment trim left and right", "x \r\n\t{{- /* */ -}}\n\n\ty", noError, `"x"{{/* */}}"y"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tr := New(test.name)
+			tr.Mode = ParseComments
+			tmpl, err := tr.Parse(test.input, "", "", make(map[string]*Tree))
+			if err != nil {
+				t.Errorf("%q: expected error; got none", test.name)
+			}
+			if result := tmpl.Root.String(); result != test.result {
+				t.Errorf("%s=(%q): got\n\t%v\nexpected\n\t%v", test.name, test.input, result, test.result)
+			}
+		})
+	}
+}
+
 type isEmptyTest struct {
 	name  string
 	input string
@@ -356,6 +382,7 @@ var isEmptyTests = []isEmptyTest{
 	{"empty", ``, true},
 	{"nonempty", `hello`, false},
 	{"spaces only", " \t\n \t\n", true},
+	{"comment only", "{{/* comment */}}", true},
 	{"definition", `{{define "x"}}something{{end}}`, true},
 	{"definitions and space", "{{define `x`}}something{{end}}\n\n{{define `y`}}something{{end}}\n\n", true},
 	{"definitions and text", "{{define `x`}}something{{end}}\nx\n{{define `y`}}something{{end}}\ny\n", false},
@@ -550,5 +577,54 @@ func BenchmarkParseLarge(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+var sinkv, sinkl string
+
+func BenchmarkVariableString(b *testing.B) {
+	v := &VariableNode{
+		Ident: []string{"$", "A", "BB", "CCC", "THIS_IS_THE_VARIABLE_BEING_PROCESSED"},
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sinkv = v.String()
+	}
+	if sinkv == "" {
+		b.Fatal("Benchmark was not run")
+	}
+}
+
+func BenchmarkListString(b *testing.B) {
+	text := `
+{{(printf .Field1.Field2.Field3).Value}}
+{{$x := (printf .Field1.Field2.Field3).Value}}
+{{$y := (printf $x.Field1.Field2.Field3).Value}}
+{{$z := $y.Field1.Field2.Field3}}
+{{if contains $y $z}}
+	{{printf "%q" $y}}
+{{else}}
+	{{printf "%q" $x}}
+{{end}}
+{{with $z.Field1 | contains "boring"}}
+	{{printf "%q" . | printf "%s"}}
+{{else}}
+	{{printf "%d %d %d" 11 11 11}}
+	{{printf "%d %d %s" 22 22 $x.Field1.Field2.Field3 | printf "%s"}}
+	{{printf "%v" (contains $z.Field1.Field2 $y)}}
+{{end}}
+`
+	tree, err := New("bench").Parse(text, "", "", make(map[string]*Tree), builtins)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sinkl = tree.Root.String()
+	}
+	if sinkl == "" {
+		b.Fatal("Benchmark was not run")
 	}
 }

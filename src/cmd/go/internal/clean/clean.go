@@ -6,6 +6,7 @@
 package clean
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -33,7 +34,8 @@ The go command builds most objects in a temporary directory,
 so go clean is mainly concerned with object files left by other
 tools or by manual invocations of go build.
 
-Specifically, clean removes the following files from each of the
+If a package argument is given or the -i or -r flag is set,
+clean removes the following files from each of the
 source directories corresponding to the import paths:
 
 	_obj/            old object directory, left from Makefiles
@@ -101,12 +103,21 @@ func init() {
 	// mentioned explicitly in the docs but they
 	// are part of the build flags.
 
-	work.AddBuildFlags(CmdClean)
+	work.AddBuildFlags(CmdClean, work.DefaultBuildFlags)
 }
 
-func runClean(cmd *base.Command, args []string) {
-	if len(args) > 0 || !modload.Enabled() || modload.HasModRoot() {
-		for _, pkg := range load.PackagesAndErrors(args) {
+func runClean(ctx context.Context, cmd *base.Command, args []string) {
+	// golang.org/issue/29925: only load packages before cleaning if
+	// either the flags and arguments explicitly imply a package,
+	// or no other target (such as a cache) was requested to be cleaned.
+	cleanPkg := len(args) > 0 || cleanI || cleanR
+	if (!modload.Enabled() || modload.HasModRoot()) &&
+		!cleanCache && !cleanModcache && !cleanTestcache {
+		cleanPkg = true
+	}
+
+	if cleanPkg {
+		for _, pkg := range load.PackagesAndErrors(ctx, args) {
 			clean(pkg)
 		}
 	}
@@ -122,18 +133,31 @@ func runClean(cmd *base.Command, args []string) {
 			// and not something that we want to remove. Also, we'd like to preserve
 			// the access log for future analysis, even if the cache is cleared.
 			subdirs, _ := filepath.Glob(filepath.Join(dir, "[0-9a-f][0-9a-f]"))
+			printedErrors := false
 			if len(subdirs) > 0 {
 				if cfg.BuildN || cfg.BuildX {
 					b.Showcmd("", "rm -r %s", strings.Join(subdirs, " "))
 				}
-				printedErrors := false
-				for _, d := range subdirs {
-					// Only print the first error - there may be many.
-					// This also mimics what os.RemoveAll(dir) would do.
-					if err := os.RemoveAll(d); err != nil && !printedErrors {
-						printedErrors = true
-						base.Errorf("go clean -cache: %v", err)
+				if !cfg.BuildN {
+					for _, d := range subdirs {
+						// Only print the first error - there may be many.
+						// This also mimics what os.RemoveAll(dir) would do.
+						if err := os.RemoveAll(d); err != nil && !printedErrors {
+							printedErrors = true
+							base.Errorf("go clean -cache: %v", err)
+						}
 					}
+				}
+			}
+
+			logFile := filepath.Join(dir, "log.txt")
+			if cfg.BuildN || cfg.BuildX {
+				b.Showcmd("", "rm -f %s", logFile)
+			}
+			if !cfg.BuildN {
+				if err := os.RemoveAll(logFile); err != nil && !printedErrors {
+					printedErrors = true
+					base.Errorf("go clean -cache: %v", err)
 				}
 			}
 		}
@@ -162,20 +186,22 @@ func runClean(cmd *base.Command, args []string) {
 				}
 			}
 			if err != nil {
-				base.Errorf("go clean -testcache: %v", err)
+				if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+					base.Errorf("go clean -testcache: %v", err)
+				}
 			}
 		}
 	}
 
 	if cleanModcache {
-		if modfetch.PkgMod == "" {
+		if cfg.GOMODCACHE == "" {
 			base.Fatalf("go clean -modcache: no module cache")
 		}
 		if cfg.BuildN || cfg.BuildX {
-			b.Showcmd("", "rm -rf %s", modfetch.PkgMod)
+			b.Showcmd("", "rm -rf %s", cfg.GOMODCACHE)
 		}
 		if !cfg.BuildN {
-			if err := modfetch.RemoveAll(modfetch.PkgMod); err != nil {
+			if err := modfetch.RemoveAll(cfg.GOMODCACHE); err != nil {
 				base.Errorf("go clean -modcache: %v", err)
 			}
 		}
@@ -214,7 +240,7 @@ func clean(p *load.Package) {
 	cleaned[p] = true
 
 	if p.Dir == "" {
-		base.Errorf("can't load package: %v", p.Error)
+		base.Errorf("%v", p.Error)
 		return
 	}
 	dirs, err := ioutil.ReadDir(p.Dir)

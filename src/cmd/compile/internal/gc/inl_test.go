@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"internal/testenv"
 	"io"
+	"math/bits"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -30,16 +31,14 @@ func TestIntendedInlining(t *testing.T) {
 	// might not actually be inlined anywhere.
 	want := map[string][]string{
 		"runtime": {
-			// TODO(mvdan): enable these once mid-stack
-			// inlining is available
-			// "adjustctxt",
-
 			"add",
 			"acquirem",
 			"add1",
 			"addb",
 			"adjustpanics",
 			"adjustpointer",
+			"alignDown",
+			"alignUp",
 			"bucketMask",
 			"bucketShift",
 			"chanbuf",
@@ -59,7 +58,6 @@ func TestIntendedInlining(t *testing.T) {
 			"readUnaligned32",
 			"readUnaligned64",
 			"releasem",
-			"round",
 			"roundupsize",
 			"stackmapdata",
 			"stringStructOf",
@@ -118,6 +116,10 @@ func TestIntendedInlining(t *testing.T) {
 			"byLiteral.Less",
 			"byLiteral.Swap",
 		},
+		"encoding/base64": {
+			"assemble32",
+			"assemble64",
+		},
 		"unicode/utf8": {
 			"FullRune",
 			"FullRuneInString",
@@ -127,33 +129,37 @@ func TestIntendedInlining(t *testing.T) {
 		"reflect": {
 			"Value.CanAddr",
 			"Value.CanSet",
+			"Value.CanInterface",
 			"Value.IsValid",
+			"Value.pointer",
 			"add",
 			"align",
+			"flag.mustBe",
+			"flag.mustBeAssignable",
+			"flag.mustBeExported",
 			"flag.kind",
 			"flag.ro",
-
-			// TODO: these use panic, need mid-stack
-			// inlining
-			// "Value.CanInterface",
-			// "Value.pointer",
-			// "flag.mustBe",
-			// "flag.mustBeAssignable",
-			// "flag.mustBeExported",
 		},
 		"regexp": {
 			"(*bitState).push",
 		},
 		"math/big": {
 			"bigEndianWord",
+			// The following functions require the math_big_pure_go build tag.
+			"addVW",
+			"subVW",
+		},
+		"math/rand": {
+			"(*rngSource).Int63",
+			"(*rngSource).Uint64",
 		},
 	}
 
-	if runtime.GOARCH != "386" && runtime.GOARCH != "mips64" && runtime.GOARCH != "mips64le" {
+	if runtime.GOARCH != "386" && runtime.GOARCH != "mips64" && runtime.GOARCH != "mips64le" && runtime.GOARCH != "riscv64" {
 		// nextFreeFast calls sys.Ctz64, which on 386 is implemented in asm and is not inlinable.
 		// We currently don't have midstack inlining so nextFreeFast is also not inlinable on 386.
-		// On MIPS64x, Ctz64 is not intrinsified and causes nextFreeFast too expensive to inline
-		// (Issue 22239).
+		// On mips64x and riscv64, Ctz64 is not intrinsified and causes nextFreeFast too expensive
+		// to inline (Issue 22239).
 		want["runtime"] = append(want["runtime"], "nextFreeFast")
 	}
 	if runtime.GOARCH != "386" {
@@ -163,10 +169,25 @@ func TestIntendedInlining(t *testing.T) {
 		want["runtime/internal/sys"] = append(want["runtime/internal/sys"], "Ctz32")
 		want["runtime/internal/sys"] = append(want["runtime/internal/sys"], "Bswap32")
 	}
-	switch runtime.GOARCH {
-	case "amd64", "amd64p32", "arm64", "mips64", "mips64le", "ppc64", "ppc64le", "s390x":
+	if bits.UintSize == 64 {
 		// rotl_31 is only defined on 64-bit architectures
 		want["runtime"] = append(want["runtime"], "rotl_31")
+	}
+
+	switch runtime.GOARCH {
+	case "386", "wasm", "arm":
+	default:
+		// TODO(mvdan): As explained in /test/inline_sync.go, some
+		// architectures don't have atomic intrinsics, so these go over
+		// the inlining budget. Move back to the main table once that
+		// problem is solved.
+		want["sync"] = []string{
+			"(*Mutex).Lock",
+			"(*Mutex).Unlock",
+			"(*RWMutex).RLock",
+			"(*RWMutex).RUnlock",
+			"(*Once).Do",
+		}
 	}
 
 	// Functions that must actually be inlined; they must have actual callers.
@@ -189,7 +210,7 @@ func TestIntendedInlining(t *testing.T) {
 		}
 	}
 
-	args := append([]string{"build", "-a", "-gcflags=all=-m -m"}, pkgs...)
+	args := append([]string{"build", "-a", "-gcflags=all=-m -m", "-tags=math_big_pure_go"}, pkgs...)
 	cmd := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), args...))
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw

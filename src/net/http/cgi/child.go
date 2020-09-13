@@ -89,8 +89,6 @@ func RequestFromMap(params map[string]string) (*http.Request, error) {
 		r.Header.Add(strings.ReplaceAll(k[5:], "_", "-"), v)
 	}
 
-	// TODO: cookies.  parsing them isn't exported, though.
-
 	uriStr := params["REQUEST_URI"]
 	if uriStr == "" {
 		// Fallback to SCRIPT_NAME, PATH_INFO and QUERY_STRING.
@@ -147,6 +145,9 @@ func Serve(handler http.Handler) error {
 	req, err := Request()
 	if err != nil {
 		return err
+	}
+	if req.Body == nil {
+		req.Body = http.NoBody
 	}
 	if handler == nil {
 		handler = http.DefaultServeMux

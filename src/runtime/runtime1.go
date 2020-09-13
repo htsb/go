@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/bytealg"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -312,9 +313,11 @@ var debug struct {
 	madvdontneed       int32 // for Linux; issue 28466
 	sbrk               int32
 	scavenge           int32
+	scavtrace          int32
 	scheddetail        int32
 	schedtrace         int32
 	tracebackancestors int32
+	asyncpreemptoff    int32
 }
 
 var dbgvars = []dbgVar{
@@ -331,9 +334,11 @@ var dbgvars = []dbgVar{
 	{"madvdontneed", &debug.madvdontneed},
 	{"sbrk", &debug.sbrk},
 	{"scavenge", &debug.scavenge},
+	{"scavtrace", &debug.scavtrace},
 	{"scheddetail", &debug.scheddetail},
 	{"schedtrace", &debug.schedtrace},
 	{"tracebackancestors", &debug.tracebackancestors},
+	{"asyncpreemptoff", &debug.asyncpreemptoff},
 }
 
 func parsedebugvars() {
@@ -343,13 +348,13 @@ func parsedebugvars() {
 
 	for p := gogetenv("GODEBUG"); p != ""; {
 		field := ""
-		i := index(p, ",")
+		i := bytealg.IndexByteString(p, ',')
 		if i < 0 {
 			field, p = p, ""
 		} else {
 			field, p = p[:i], p[i+1:]
 		}
-		i = index(field, "=")
+		i = bytealg.IndexByteString(field, '=')
 		if i < 0 {
 			continue
 		}
@@ -412,6 +417,7 @@ func setTraceback(level string) {
 // This is a very special function, do not use it if you are not sure what you are doing.
 // int64 division is lowered into _divv() call on 386, which does not fit into nosplit functions.
 // Handles overflow in a time-specific manner.
+// This keeps us within no-split stack limits on 32-bit processors.
 //go:nosplit
 func timediv(v int64, div int32, rem *int32) int32 {
 	res := int32(0)
@@ -454,11 +460,6 @@ func releasem(mp *m) {
 	}
 }
 
-//go:nosplit
-func gomcache() *mcache {
-	return getg().m.mcache
-}
-
 //go:linkname reflect_typelinks reflect.typelinks
 func reflect_typelinks() ([]unsafe.Pointer, [][]int32) {
 	modules := activeModules()
@@ -483,7 +484,7 @@ func reflect_resolveTypeOff(rtype unsafe.Pointer, off int32) unsafe.Pointer {
 	return unsafe.Pointer((*_type)(rtype).typeOff(typeOff(off)))
 }
 
-// reflect_resolveTextOff resolves an function pointer offset from a base type.
+// reflect_resolveTextOff resolves a function pointer offset from a base type.
 //go:linkname reflect_resolveTextOff reflect.resolveTextOff
 func reflect_resolveTextOff(rtype unsafe.Pointer, off int32) unsafe.Pointer {
 	return (*_type)(rtype).textOff(textOff(off))

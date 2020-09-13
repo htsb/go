@@ -20,6 +20,8 @@ var jsProcess = js.Global().Get("process")
 var jsFS = js.Global().Get("fs")
 var constants = jsFS.Get("constants")
 
+var uint8Array = js.Global().Get("Uint8Array")
+
 var (
 	nodeWRONLY = constants.Get("O_WRONLY").Int()
 	nodeRDWR   = constants.Get("O_RDWR").Int()
@@ -32,15 +34,16 @@ var (
 type jsFile struct {
 	path    string
 	entries []string
+	dirIdx  int // entries[:dirIdx] have already been returned in ReadDirent
 	pos     int64
 	seeked  bool
 }
 
 var filesMu sync.Mutex
 var files = map[int]*jsFile{
-	0: &jsFile{},
-	1: &jsFile{},
-	2: &jsFile{},
+	0: {},
+	1: {},
+	2: {},
 }
 
 func fdToFile(fd int) (*jsFile, error) {
@@ -99,6 +102,10 @@ func Open(path string, openmode int, perm uint32) (int, error) {
 		}
 	}
 
+	if path[0] != '/' {
+		cwd := jsProcess.Call("cwd").String()
+		path = cwd + "/" + path
+	}
 	f := &jsFile{
 		path:    path,
 		entries: entries,
@@ -139,8 +146,8 @@ func ReadDirent(fd int, buf []byte) (int, error) {
 	}
 
 	n := 0
-	for len(f.entries) > 0 {
-		entry := f.entries[0]
+	for f.dirIdx < len(f.entries) {
+		entry := f.entries[f.dirIdx]
 		l := 2 + len(entry)
 		if l > len(buf) {
 			break
@@ -150,7 +157,7 @@ func ReadDirent(fd int, buf []byte) (int, error) {
 		copy(buf[2:], entry)
 		buf = buf[l:]
 		n += l
-		f.entries = f.entries[1:]
+		f.dirIdx++
 	}
 
 	return n, nil
@@ -244,18 +251,26 @@ func Chown(path string, uid, gid int) error {
 	if err := checkPath(path); err != nil {
 		return err
 	}
-	return ENOSYS
+	_, err := fsCall("chown", path, uint32(uid), uint32(gid))
+	return err
 }
 
 func Fchown(fd int, uid, gid int) error {
-	return ENOSYS
+	_, err := fsCall("fchown", fd, uint32(uid), uint32(gid))
+	return err
 }
 
 func Lchown(path string, uid, gid int) error {
 	if err := checkPath(path); err != nil {
 		return err
 	}
-	return ENOSYS
+	if jsFS.Get("lchown").IsUndefined() {
+		// fs.lchown is unavailable on Linux until Node.js 10.6.0
+		// TODO(neelance): remove when we require at least this Node.js version
+		return ENOSYS
+	}
+	_, err := fsCall("lchown", path, uint32(uid), uint32(gid))
+	return err
 }
 
 func UtimesNano(path string, ts []Timespec) error {
@@ -370,12 +385,13 @@ func Read(fd int, b []byte) (int, error) {
 		return n, err
 	}
 
-	a := js.TypedArrayOf(b)
-	n, err := fsCall("read", fd, a, 0, len(b), nil)
-	a.Release()
+	buf := uint8Array.New(len(b))
+	n, err := fsCall("read", fd, buf, 0, len(b), nil)
 	if err != nil {
 		return 0, err
 	}
+	js.CopyBytesToGo(b, buf)
+
 	n2 := n.Int()
 	f.pos += int64(n2)
 	return n2, err
@@ -393,9 +409,17 @@ func Write(fd int, b []byte) (int, error) {
 		return n, err
 	}
 
-	a := js.TypedArrayOf(b)
-	n, err := fsCall("write", fd, a, 0, len(b), nil)
-	a.Release()
+	if faketime && (fd == 1 || fd == 2) {
+		n := faketimeWrite(fd, b)
+		if n < 0 {
+			return 0, errnoErr(Errno(-n))
+		}
+		return n, nil
+	}
+
+	buf := uint8Array.New(len(b))
+	js.CopyBytesToJS(buf, b)
+	n, err := fsCall("write", fd, buf, 0, len(b), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -405,19 +429,19 @@ func Write(fd int, b []byte) (int, error) {
 }
 
 func Pread(fd int, b []byte, offset int64) (int, error) {
-	a := js.TypedArrayOf(b)
-	n, err := fsCall("read", fd, a, 0, len(b), offset)
-	a.Release()
+	buf := uint8Array.New(len(b))
+	n, err := fsCall("read", fd, buf, 0, len(b), offset)
 	if err != nil {
 		return 0, err
 	}
+	js.CopyBytesToGo(b, buf)
 	return n.Int(), nil
 }
 
 func Pwrite(fd int, b []byte, offset int64) (int, error) {
-	a := js.TypedArrayOf(b)
-	n, err := fsCall("write", fd, a, 0, len(b), offset)
-	a.Release()
+	buf := uint8Array.New(len(b))
+	js.CopyBytesToJS(buf, b)
+	n, err := fsCall("write", fd, buf, 0, len(b), offset)
 	if err != nil {
 		return 0, err
 	}
@@ -451,6 +475,7 @@ func Seek(fd int, offset int64, whence int) (int64, error) {
 	}
 
 	f.seeked = true
+	f.dirIdx = 0 // Reset directory read position. See issue 35767.
 	f.pos = newPos
 	return newPos, nil
 }
@@ -474,11 +499,11 @@ func fsCall(name string, args ...interface{}) (js.Value, error) {
 	}
 
 	c := make(chan callResult, 1)
-	jsFS.Call(name, append(args, js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	f := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		var res callResult
 
 		if len(args) >= 1 { // on Node.js 8, fs.utimes calls the callback without any arguments
-			if jsErr := args[0]; jsErr != js.Null() {
+			if jsErr := args[0]; !jsErr.IsNull() {
 				res.err = mapJSError(jsErr)
 			}
 		}
@@ -490,7 +515,9 @@ func fsCall(name string, args ...interface{}) (js.Value, error) {
 
 		c <- res
 		return nil
-	}))...)
+	})
+	defer f.Release()
+	jsFS.Call(name, append(args, f)...)
 	res := <-c
 	return res.val, res.err
 }

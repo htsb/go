@@ -63,7 +63,7 @@ func f5(a [10]int) int {
 
 func f6(a []int) {
 	for i := range a { // ERROR "Induction variable: limits \[0,\?\), increment 1$"
-		b := a[0:i] // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$" "(\([0-9]+\) )?Proved Geq64$"
+		b := a[0:i] // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
 		f6(b)
 	}
 }
@@ -186,10 +186,10 @@ func k0(a [100]int) [100]int {
 
 func k1(a [100]int) [100]int {
 	for i := 10; i < 90; i++ { // ERROR "Induction variable: limits \[10,90\), increment 1$"
-		useSlice(a[:i-11]) // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
+		useSlice(a[:i-11])
 		useSlice(a[:i-10]) // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
 		useSlice(a[:i-5])  // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
-		useSlice(a[:i])    // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$" "(\([0-9]+\) )?Proved Geq64$"
+		useSlice(a[:i])    // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
 		useSlice(a[:i+5])  // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
 		useSlice(a[:i+10]) // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
 		useSlice(a[:i+11]) // ERROR "(\([0-9]+\) )?Proved IsSliceInBounds$"
@@ -253,6 +253,39 @@ func k5(a [100]int) [100]int {
 	for i := max - 50; i < max; i++ { // ERROR "Induction variable: limits \[9223372036854775757,9223372036854775807\), increment 1$"
 		a[i-max+50] = i   // ERROR "(\([0-9]+\) )?Proved IsInBounds$"
 		a[i-(max-70)] = i // ERROR "(\([0-9]+\) )?Proved IsInBounds$"
+	}
+	return a
+}
+
+func d1(a [100]int) [100]int {
+	for i := 0; i < 100; i++ { // ERROR "Induction variable: limits \[0,100\), increment 1$"
+		for j := 0; j < i; j++ { // ERROR "Induction variable: limits \[0,\?\), increment 1$"
+			a[j] = 0   // ERROR "Proved IsInBounds$"
+			a[j+1] = 0 // FIXME: this boundcheck should be eliminated
+			a[j+2] = 0
+		}
+	}
+	return a
+}
+
+func d2(a [100]int) [100]int {
+	for i := 0; i < 100; i++ { // ERROR "Induction variable: limits \[0,100\), increment 1$"
+		for j := 0; i > j; j++ { // ERROR "Induction variable: limits \[0,\?\), increment 1$"
+			a[j] = 0   // ERROR "Proved IsInBounds$"
+			a[j+1] = 0 // FIXME: this boundcheck should be eliminated
+			a[j+2] = 0
+		}
+	}
+	return a
+}
+
+func d3(a [100]int) [100]int {
+	for i := 0; i <= 99; i++ { // ERROR "Induction variable: limits \[0,99\], increment 1$"
+		for j := 0; j <= i-1; j++ { // ERROR "Induction variable: limits \[0,\?\], increment 1$"
+			a[j] = 0   // ERROR "Proved IsInBounds$"
+			a[j+1] = 0 // ERROR "Proved IsInBounds$"
+			a[j+2] = 0
+		}
 	}
 	return a
 }

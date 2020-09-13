@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -247,6 +248,20 @@ func TestDecodeCorrupt(t *testing.T) {
 	}
 }
 
+func TestDecodeBounds(t *testing.T) {
+	var buf [32]byte
+	s := StdEncoding.EncodeToString(buf[:])
+	defer func() {
+		if err := recover(); err != nil {
+			t.Fatalf("Decode panicked unexpectedly: %v\n%s", err, debug.Stack())
+		}
+	}()
+	n, err := StdEncoding.Decode(buf[:], []byte(s))
+	if n != len(buf) || err != nil {
+		t.Fatalf("StdEncoding.Decode = %d, %v, want %d, nil", n, err, len(buf))
+	}
+}
+
 func TestEncodedLen(t *testing.T) {
 	for _, tt := range []struct {
 		enc  *Encoding
@@ -386,7 +401,7 @@ func TestDecoderIssue3577(t *testing.T) {
 		source: "VHdhcyBicmlsbGlnLCBhbmQgdGhlIHNsaXRoeSB0b3Zlcw==", // twas brillig...
 		nextc:  next,
 	})
-	errc := make(chan error)
+	errc := make(chan error, 1)
 	go func() {
 		_, err := ioutil.ReadAll(d)
 		errc <- err

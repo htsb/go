@@ -7,6 +7,7 @@
 package reflectlite
 
 import (
+	"internal/unsafeheader"
 	"unsafe"
 )
 
@@ -35,6 +36,10 @@ type Type interface {
 	// will be the empty string.
 	PkgPath() string
 
+	// Size returns the number of bytes needed to store
+	// a value of the given type; it is analogous to unsafe.Sizeof.
+	Size() uintptr
+
 	// Kind returns the specific kind of this type.
 	Kind() Kind
 
@@ -43,6 +48,16 @@ type Type interface {
 
 	// AssignableTo reports whether a value of the type is assignable to type u.
 	AssignableTo(u Type) bool
+
+	// Comparable reports whether values of this type are comparable.
+	Comparable() bool
+
+	// String returns a string representation of the type.
+	// The string representation may use shortened package names
+	// (e.g., base64 instead of "encoding/base64") and is not
+	// guaranteed to be unique among types. To test for type identity,
+	// compare the Types directly.
+	String() string
 
 	// Elem returns a type's element type.
 	// It panics if the type's Kind is not Ptr.
@@ -123,6 +138,10 @@ const (
 
 	// tflagNamed means the type has a name.
 	tflagNamed tflag = 1 << 2
+
+	// tflagRegularMemory means that equal and hash functions can treat
+	// this type as a single region of t.size bytes.
+	tflagRegularMemory tflag = 1 << 3
 )
 
 // rtype is the common implementation of most values.
@@ -131,26 +150,18 @@ const (
 // rtype must be kept in sync with ../runtime/type.go:/^type._type.
 type rtype struct {
 	size       uintptr
-	ptrdata    uintptr  // number of bytes in the type that can contain pointers
-	hash       uint32   // hash of type; avoids computation in hash tables
-	tflag      tflag    // extra type information flags
-	align      uint8    // alignment of variable with this type
-	fieldAlign uint8    // alignment of struct field with this type
-	kind       uint8    // enumeration for C
-	alg        *typeAlg // algorithm table
-	gcdata     *byte    // garbage collection data
-	str        nameOff  // string form
-	ptrToThis  typeOff  // type for pointer to this type, may be zero
-}
-
-// a copy of runtime.typeAlg
-type typeAlg struct {
-	// function for hashing objects of this type
-	// (ptr to object, seed) -> hash
-	hash func(unsafe.Pointer, uintptr) uintptr
+	ptrdata    uintptr // number of bytes in the type that can contain pointers
+	hash       uint32  // hash of type; avoids computation in hash tables
+	tflag      tflag   // extra type information flags
+	align      uint8   // alignment of variable with this type
+	fieldAlign uint8   // alignment of struct field with this type
+	kind       uint8   // enumeration for C
 	// function for comparing objects of this type
 	// (ptr to object A, ptr to object B) -> ==?
-	equal func(unsafe.Pointer, unsafe.Pointer) bool
+	equal     func(unsafe.Pointer, unsafe.Pointer) bool
+	gcdata    *byte   // garbage collection data
+	str       nameOff // string form
+	ptrToThis typeOff // type for pointer to this type, may be zero
 }
 
 // Method on non-interface type
@@ -230,8 +241,11 @@ type interfaceType struct {
 // mapType represents a map type.
 type mapType struct {
 	rtype
-	key        *rtype // map key type
-	elem       *rtype // map element (value) type
+	key    *rtype // map key type
+	elem   *rtype // map element (value) type
+	bucket *rtype // internal bucket structure
+	// function for hashing keys (ptr to key, seed) -> hash
+	hasher     func(unsafe.Pointer, uintptr) uintptr
 	keysize    uint8  // size of key slot
 	valuesize  uint8  // size of value slot
 	bucketsize uint16 // size of bucket
@@ -325,7 +339,7 @@ func (n name) name() (s string) {
 	}
 	b := (*[4]byte)(unsafe.Pointer(n.bytes))
 
-	hdr := (*stringHeader)(unsafe.Pointer(&s))
+	hdr := (*unsafeheader.String)(unsafe.Pointer(&s))
 	hdr.Data = unsafe.Pointer(&b[3])
 	hdr.Len = int(b[1])<<8 | int(b[2])
 	return s
@@ -337,7 +351,7 @@ func (n name) tag() (s string) {
 		return ""
 	}
 	nl := n.nameLen()
-	hdr := (*stringHeader)(unsafe.Pointer(&s))
+	hdr := (*unsafeheader.String)(unsafe.Pointer(&s))
 	hdr.Data = unsafe.Pointer(n.data(3+nl+2, "non-empty string"))
 	hdr.Len = tl
 	return s
@@ -367,7 +381,6 @@ func (n name) pkgPath() string {
 const (
 	kindDirectIface = 1 << 5
 	kindGCProg      = 1 << 6 // Type.gc points to GC program
-	kindNoPointers  = 1 << 7
 	kindMask        = (1 << 5) - 1
 )
 
@@ -473,7 +486,11 @@ func (t *rtype) String() string {
 	return s
 }
 
+func (t *rtype) Size() uintptr { return t.size }
+
 func (t *rtype) Kind() Kind { return Kind(t.kind & kindMask) }
+
+func (t *rtype) pointers() bool { return t.ptrdata != 0 }
 
 func (t *rtype) common() *rtype { return t }
 
@@ -504,16 +521,17 @@ func (t *rtype) PkgPath() string {
 	return t.nameOff(ut.pkgPath).name()
 }
 
+func (t *rtype) hasName() bool {
+	return t.tflag&tflagNamed != 0
+}
+
 func (t *rtype) Name() string {
-	if t.tflag&tflagNamed == 0 {
+	if !t.hasName() {
 		return ""
 	}
 	s := t.String()
 	i := len(s) - 1
-	for i >= 0 {
-		if s[i] == '.' {
-			break
-		}
+	for i >= 0 && s[i] != '.' {
 		i--
 	}
 	return s[i+1:]
@@ -612,7 +630,7 @@ func (t *funcType) in() []*rtype {
 	if t.inCount == 0 {
 		return nil
 	}
-	return (*[1 << 20]*rtype)(add(unsafe.Pointer(t), uadd, "t.inCount > 0"))[:t.inCount]
+	return (*[1 << 20]*rtype)(add(unsafe.Pointer(t), uadd, "t.inCount > 0"))[:t.inCount:t.inCount]
 }
 
 func (t *funcType) out() []*rtype {
@@ -624,7 +642,7 @@ func (t *funcType) out() []*rtype {
 	if outCount == 0 {
 		return nil
 	}
-	return (*[1 << 20]*rtype)(add(unsafe.Pointer(t), uadd, "outCount > 0"))[t.inCount : t.inCount+outCount]
+	return (*[1 << 20]*rtype)(add(unsafe.Pointer(t), uadd, "outCount > 0"))[t.inCount : t.inCount+outCount : t.inCount+outCount]
 }
 
 // add returns p+x.
@@ -664,6 +682,10 @@ func (t *rtype) AssignableTo(u Type) bool {
 	}
 	uu := u.(*rtype)
 	return directlyAssignable(uu, t) || implements(uu, t)
+}
+
+func (t *rtype) Comparable() bool {
+	return t.equal != nil
 }
 
 // implements reports whether the type V implements the interface type T.
@@ -764,7 +786,7 @@ func directlyAssignable(T, V *rtype) bool {
 
 	// Otherwise at least one of T and V must not be defined
 	// and they must have the same kind.
-	if T.Name() != "" && V.Name() != "" || T.Kind() != V.Kind() {
+	if T.hasName() && V.hasName() || T.Kind() != V.Kind() {
 		return false
 	}
 

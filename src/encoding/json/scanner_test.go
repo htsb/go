@@ -6,6 +6,8 @@ package json
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"reflect"
@@ -48,6 +50,7 @@ var examples = []example{
 	{`[1,2,3]`, "[\n\t1,\n\t2,\n\t3\n]"},
 	{`{"x":1}`, "{\n\t\"x\": 1\n}"},
 	{ex1, ex1i},
+	{"{\"\":\"<>&\u2028\u2029\"}", "{\n\t\"\": \"<>&\u2028\u2029\"\n}"}, // See golang.org/issue/34070
 }
 
 var ex1 = `[true,false,null,"x",1,1.5,0,-5e+2]`
@@ -89,8 +92,8 @@ func TestCompactSeparators(t *testing.T) {
 	tests := []struct {
 		in, compact string
 	}{
-		{"{\"\u2028\": 1}", `{"\u2028":1}`},
-		{"{\"\u2029\" :2}", `{"\u2029":2}`},
+		{"{\"\u2028\": 1}", "{\"\u2028\":1}"},
+		{"{\"\u2029\" :2}", "{\"\u2029\":2}"},
 	}
 	for _, tt := range tests {
 		var buf bytes.Buffer
@@ -197,6 +200,13 @@ func TestIndentErrors(t *testing.T) {
 				continue
 			}
 		}
+	}
+}
+
+func TestSyntaxErrorIs(t *testing.T) {
+	err := fmt.Errorf("apackage: %w: failed to parse struct", &SyntaxError{"some error", 43})
+	if !errors.Is(err, &SyntaxError{}) {
+		t.Fatalf("%v should be unwrapped to a SyntaxError", err)
 	}
 }
 

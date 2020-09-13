@@ -182,6 +182,9 @@ func (p *Package) Translate(f *File) {
 		numTypedefs = len(p.typedefs)
 		// Also ask about any typedefs we've seen so far.
 		for _, info := range p.typedefList {
+			if f.Name[info.typedef] != nil {
+				continue
+			}
 			n := &Name{
 				Go: info.typedef,
 				C:  info.typedef,
@@ -333,7 +336,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 	//	void __cgo_f_xxx_5(void) { static const char __cgo_undefined__5[] = (name); }
 	//
 	// If we see an error at not-declared:xxx, the corresponding name is not declared.
-	// If we see an error at not-type:xxx, the corresponding name is a type.
+	// If we see an error at not-type:xxx, the corresponding name is not a type.
 	// If we see an error at not-int-const:xxx, the corresponding name is not an integer constant.
 	// If we see an error at not-num-const:xxx, the corresponding name is not a number constant.
 	// If we see an error at not-str-lit:xxx, the corresponding name is not a string literal.
@@ -366,7 +369,18 @@ func (p *Package) guessKinds(f *File) []*Name {
 	fmt.Fprintf(&b, "#line 1 \"completed\"\n"+
 		"int __cgo__1 = __cgo__2;\n")
 
-	stderr := p.gccErrors(b.Bytes())
+	// We need to parse the output from this gcc command, so ensure that it
+	// doesn't have any ANSI escape sequences in it. (TERM=dumb is
+	// insufficient; if the user specifies CGO_CFLAGS=-fdiagnostics-color,
+	// GCC will ignore TERM, and GCC can also be configured at compile-time
+	// to ignore TERM.)
+	stderr := p.gccErrors(b.Bytes(), "-fdiagnostics-color=never")
+	if strings.Contains(stderr, "unrecognized command line option") {
+		// We're using an old version of GCC that doesn't understand
+		// -fdiagnostics-color. Those versions can't print color anyway,
+		// so just rerun without that option.
+		stderr = p.gccErrors(b.Bytes())
+	}
 	if stderr == "" {
 		fatalf("%s produced no output\non input:\n%s", p.gccBaseCmd()[0], b.Bytes())
 	}
@@ -710,6 +724,9 @@ func (p *Package) prepareNames(f *File) {
 			}
 		}
 		p.mangleName(n)
+		if n.Kind == "type" && typedef[n.Mangle] == nil {
+			typedef[n.Mangle] = n.Type
+		}
 	}
 }
 
@@ -793,10 +810,10 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	params := name.FuncType.Params
 	args := call.Call.Args
 
-	// Avoid a crash if the number of arguments is
-	// less than the number of parameters.
+	// Avoid a crash if the number of arguments doesn't match
+	// the number of parameters.
 	// This will be caught when the generated file is compiled.
-	if len(args) < len(params) {
+	if len(args) != len(params) {
 		return "", false
 	}
 
@@ -816,7 +833,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	// Rewrite C.f(p) to
 	//    func() {
 	//            _cgo0 := p
-	//            _cgoCheckPointer(_cgo0)
+	//            _cgoCheckPointer(_cgo0, nil)
 	//            C.f(_cgo0)
 	//    }()
 	// Using a function literal like this lets us evaluate the
@@ -834,7 +851,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	//    defer func() func() {
 	//            _cgo0 := p
 	//            return func() {
-	//                    _cgoCheckPointer(_cgo0)
+	//                    _cgoCheckPointer(_cgo0, nil)
 	//                    C.f(_cgo0)
 	//            }
 	//    }()()
@@ -897,21 +914,16 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 			needsUnsafe = true
 		}
 
-		// Explicitly convert untyped constants to the
-		// parameter type, to avoid a type mismatch.
-		if p.isConst(f, arg) {
-			ptype := p.rewriteUnsafe(param.Go)
+		// Use "var x T = ..." syntax to explicitly convert untyped
+		// constants to the parameter type, to avoid a type mismatch.
+		ptype := p.rewriteUnsafe(param.Go)
+
+		if !p.needsPointerCheck(f, param.Go, args[i]) || param.BadPointer {
 			if ptype != param.Go {
 				needsUnsafe = true
 			}
-			arg = &ast.CallExpr{
-				Fun:  ptype,
-				Args: []ast.Expr{arg},
-			}
-		}
-
-		if !p.needsPointerCheck(f, param.Go, args[i]) {
-			fmt.Fprintf(&sb, "_cgo%d := %s; ", i, gofmtPos(arg, origArg.Pos()))
+			fmt.Fprintf(&sb, "var _cgo%d %s = %s; ", i,
+				gofmtLine(ptype), gofmtPos(arg, origArg.Pos()))
 			continue
 		}
 
@@ -926,7 +938,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 		}
 
 		fmt.Fprintf(&sb, "_cgo%d := %s; ", i, gofmtPos(arg, origArg.Pos()))
-		fmt.Fprintf(&sbCheck, "_cgoCheckPointer(_cgo%d); ", i)
+		fmt.Fprintf(&sbCheck, "_cgoCheckPointer(_cgo%d, nil); ", i)
 	}
 
 	if call.Deferred {
@@ -1244,53 +1256,14 @@ func (p *Package) isType(t ast.Expr) bool {
 		if strings.HasPrefix(t.Name, "_Ctype_") {
 			return true
 		}
+	case *ast.ParenExpr:
+		return p.isType(t.X)
 	case *ast.StarExpr:
 		return p.isType(t.X)
 	case *ast.ArrayType, *ast.StructType, *ast.FuncType, *ast.InterfaceType,
 		*ast.MapType, *ast.ChanType:
 
 		return true
-	}
-	return false
-}
-
-// isConst reports whether x is an untyped constant expression.
-func (p *Package) isConst(f *File, x ast.Expr) bool {
-	switch x := x.(type) {
-	case *ast.BasicLit:
-		return true
-	case *ast.SelectorExpr:
-		id, ok := x.X.(*ast.Ident)
-		if !ok || id.Name != "C" {
-			return false
-		}
-		name := f.Name[x.Sel.Name]
-		if name != nil {
-			return name.IsConst()
-		}
-	case *ast.Ident:
-		return x.Name == "nil" ||
-			strings.HasPrefix(x.Name, "_Ciconst_") ||
-			strings.HasPrefix(x.Name, "_Cfconst_") ||
-			strings.HasPrefix(x.Name, "_Csconst_") ||
-			consts[x.Name]
-	case *ast.UnaryExpr:
-		return p.isConst(f, x.X)
-	case *ast.BinaryExpr:
-		return p.isConst(f, x.X) && p.isConst(f, x.Y)
-	case *ast.ParenExpr:
-		return p.isConst(f, x.X)
-	case *ast.CallExpr:
-		// Calling the builtin function complex on two untyped
-		// constants returns an untyped constant.
-		// TODO: It's possible to construct a case that will
-		// erroneously succeed if there is a local function
-		// named "complex", shadowing the builtin, that returns
-		// a numeric type. I can't think of any cases that will
-		// erroneously fail.
-		if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "complex" && len(x.Args) == 2 {
-			return p.isConst(f, x.Args[0]) && p.isConst(f, x.Args[1])
-		}
 	}
 	return false
 }
@@ -1302,6 +1275,8 @@ func (p *Package) isVariable(x ast.Expr) bool {
 		return true
 	case *ast.SelectorExpr:
 		return p.isVariable(x.X)
+	case *ast.IndexExpr:
+		return true
 	}
 	return false
 }
@@ -1390,6 +1365,9 @@ func (p *Package) rewriteRef(f *File) {
 
 		if *godefs {
 			// Substitute definition for mangled type name.
+			if r.Name.Type != nil && r.Name.Kind == "type" {
+				expr = r.Name.Type.Go
+			}
 			if id, ok := expr.(*ast.Ident); ok {
 				if t := typedef[id.Name]; t != nil {
 					expr = t.Go
@@ -1455,9 +1433,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 				r.Context = ctxType
 				if r.Name.Type == nil {
 					error_(r.Pos(), "invalid conversion to C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-					break
 				}
-				expr = r.Name.Type.Go
 				break
 			}
 			error_(r.Pos(), "call of non-function C.%s", fixGo(r.Name.Go))
@@ -1514,9 +1490,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 			// Okay - might be new(T)
 			if r.Name.Type == nil {
 				error_(r.Pos(), "expression C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-				break
 			}
-			expr = r.Name.Type.Go
 		case "var":
 			expr = &ast.StarExpr{Star: (*r.Expr).Pos(), X: expr}
 		case "macro":
@@ -1535,8 +1509,6 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 			// Use of C.enum_x, C.struct_x or C.union_x without C definition.
 			// GCC won't raise an error when using pointers to such unknown types.
 			error_(r.Pos(), "type C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-		} else {
-			expr = r.Name.Type.Go
 		}
 	default:
 		if r.Name.Kind == "func" {
@@ -1633,6 +1605,7 @@ func (p *Package) gccCmd() []string {
 	c = append(c, p.gccMachine()...)
 	if goos == "aix" {
 		c = append(c, "-maix64")
+		c = append(c, "-mcmodel=large")
 	}
 	c = append(c, "-") //read input from standard input
 	return c
@@ -2008,22 +1981,25 @@ func (p *Package) gccDefines(stdin []byte) string {
 // gccErrors runs gcc over the C program stdin and returns
 // the errors that gcc prints. That is, this function expects
 // gcc to fail.
-func (p *Package) gccErrors(stdin []byte) string {
+func (p *Package) gccErrors(stdin []byte, extraArgs ...string) string {
 	// TODO(rsc): require failure
 	args := p.gccCmd()
 
 	// Optimization options can confuse the error messages; remove them.
-	nargs := make([]string, 0, len(args))
+	nargs := make([]string, 0, len(args)+len(extraArgs))
 	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-O") {
 			nargs = append(nargs, arg)
 		}
 	}
 
-	// Force -O0 optimization but keep the trailing "-" at the end.
-	nargs = append(nargs, "-O0")
-	nl := len(nargs)
-	nargs[nl-2], nargs[nl-1] = nargs[nl-1], nargs[nl-2]
+	// Force -O0 optimization and append extra arguments, but keep the
+	// trailing "-" at the end.
+	li := len(nargs) - 1
+	last := nargs[li]
+	nargs[li] = "-O0"
+	nargs = append(nargs, extraArgs...)
+	nargs = append(nargs, last)
 
 	if *debugGcc {
 		fmt.Fprintf(os.Stderr, "$ %s <<EOF\n", strings.Join(nargs, " "))
@@ -2100,6 +2076,10 @@ var goIdent = make(map[string]*ast.Ident)
 // unionWithPointer is true for a Go type that represents a C union (or class)
 // that may contain a pointer. This is used for cgo pointer checking.
 var unionWithPointer = make(map[ast.Expr]bool)
+
+// anonymousStructTag provides a consistent tag for an anonymous struct.
+// The same dwarf.StructType pointer will always get the same tag.
+var anonymousStructTag = make(map[*dwarf.StructType]string)
 
 func (c *typeConv) Init(ptrSize, intSize int64) {
 	c.ptrSize = ptrSize
@@ -2230,6 +2210,11 @@ func (c *typeConv) FinishType(pos token.Pos) {
 // Type returns a *Type with the same memory layout as
 // dtype when used as the type of a variable or a struct field.
 func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
+	return c.loadType(dtype, pos, "")
+}
+
+// loadType recursively loads the requested dtype and its dependency graph.
+func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Type {
 	// Always recompute bad pointer typedefs, as the set of such
 	// typedefs changes as we see more types.
 	checkCache := true
@@ -2237,7 +2222,9 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 		checkCache = false
 	}
 
-	key := dtype.String()
+	// The cache key should be relative to its parent.
+	// See issue https://golang.org/issue/31891
+	key := parent + " > " + dtype.String()
 
 	if checkCache {
 		if t, ok := c.m[key]; ok {
@@ -2442,8 +2429,12 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 			break
 		}
 		if tag == "" {
-			tag = "__" + strconv.Itoa(tagGen)
-			tagGen++
+			tag = anonymousStructTag[dt]
+			if tag == "" {
+				tag = "__" + strconv.Itoa(tagGen)
+				tagGen++
+				anonymousStructTag[dt] = tag
+			}
 		} else if t.C.Empty() {
 			t.C.Set(dt.Kind + " " + tag)
 		}
@@ -2506,18 +2497,27 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 		}
 		name := c.Ident("_Ctype_" + dt.Name)
 		goIdent[name.Name] = name
-		sub := c.Type(dt.Type, pos)
+		akey := ""
+		if c.anonymousStructTypedef(dt) {
+			// only load type recursively for typedefs of anonymous
+			// structs, see issues 37479 and 37621.
+			akey = key
+		}
+		sub := c.loadType(dt.Type, pos, akey)
 		if c.badPointerTypedef(dt) {
 			// Treat this typedef as a uintptr.
 			s := *sub
 			s.Go = c.uintptr
+			s.BadPointer = true
 			sub = &s
 			// Make sure we update any previously computed type.
 			if oldType := typedef[name.Name]; oldType != nil {
 				oldType.Go = sub.Go
+				oldType.BadPointer = true
 			}
 		}
 		t.Go = name
+		t.BadPointer = sub.BadPointer
 		if unionWithPointer[sub.Go] {
 			unionWithPointer[t.Go] = true
 		}
@@ -2527,6 +2527,7 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 		if oldType == nil {
 			tt := *t
 			tt.Go = sub.Go
+			tt.BadPointer = sub.BadPointer
 			typedef[name.Name] = &tt
 		}
 
@@ -3023,8 +3024,16 @@ func fieldPrefix(fld []*ast.Field) string {
 	return prefix
 }
 
-// badPointerTypedef reports whether t is a C typedef that should not be considered a pointer in Go.
-// A typedef is bad if C code sometimes stores non-pointers in this type.
+// anonymousStructTypedef reports whether dt is a C typedef for an anonymous
+// struct.
+func (c *typeConv) anonymousStructTypedef(dt *dwarf.TypedefType) bool {
+	st, ok := dt.Type.(*dwarf.StructType)
+	return ok && st.StructName == ""
+}
+
+// badPointerTypedef reports whether dt is a C typedef that should not be
+// considered a pointer in Go. A typedef is bad if C code sometimes stores
+// non-pointers in this type.
 // TODO: Currently our best solution is to find these manually and list them as
 // they come up. A better solution is desired.
 func (c *typeConv) badPointerTypedef(dt *dwarf.TypedefType) bool {
@@ -3034,7 +3043,7 @@ func (c *typeConv) badPointerTypedef(dt *dwarf.TypedefType) bool {
 	if c.badJNI(dt) {
 		return true
 	}
-	if c.badEGLDisplay(dt) {
+	if c.badEGLType(dt) {
 		return true
 	}
 	return false
@@ -3173,11 +3182,11 @@ func (c *typeConv) badJNI(dt *dwarf.TypedefType) bool {
 	return false
 }
 
-func (c *typeConv) badEGLDisplay(dt *dwarf.TypedefType) bool {
-	if dt.Name != "EGLDisplay" {
+func (c *typeConv) badEGLType(dt *dwarf.TypedefType) bool {
+	if dt.Name != "EGLDisplay" && dt.Name != "EGLConfig" {
 		return false
 	}
-	// Check that the typedef is "typedef void *EGLDisplay".
+	// Check that the typedef is "typedef void *<name>".
 	if ptr, ok := dt.Type.(*dwarf.PtrType); ok {
 		if _, ok := ptr.Type.(*dwarf.VoidType); ok {
 			return true

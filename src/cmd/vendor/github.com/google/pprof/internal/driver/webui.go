@@ -82,7 +82,7 @@ type webArgs struct {
 	FlameGraph  template.JS
 }
 
-func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options) error {
+func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options, disableBrowser bool) error {
 	host, port, err := getHostAndPort(hostport)
 	if err != nil {
 		return err
@@ -117,8 +117,12 @@ func serveWebInterface(hostport string, p *profile.Profile, o *plugin.Options) e
 		},
 	}
 
-	if o.UI.WantBrowser() {
-		go openBrowser("http://"+args.Hostport, o)
+	url := "http://" + args.Hostport
+
+	o.UI.Print("Serving web UI on ", url)
+
+	if o.UI.WantBrowser() && !disableBrowser {
+		go openBrowser(url, o)
 	}
 	return server(args)
 }
@@ -179,9 +183,16 @@ func defaultWebServer(args *plugin.HTTPServerArgs) error {
 	// https://github.com/google/pprof/pull/348
 	mux := http.NewServeMux()
 	mux.Handle("/ui/", http.StripPrefix("/ui", handler))
-	mux.Handle("/", http.RedirectHandler("/ui/", http.StatusTemporaryRedirect))
+	mux.Handle("/", redirectWithQuery("/ui"))
 	s := &http.Server{Handler: mux}
 	return s.Serve(ln)
+}
+
+func redirectWithQuery(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pathWithQuery := &gourl.URL{Path: path, RawQuery: r.URL.RawQuery}
+		http.Redirect(w, r, pathWithQuery.String(), http.StatusTemporaryRedirect)
+	}
 }
 
 func isLocalhost(host string) bool {
@@ -323,7 +334,7 @@ func dotToSvg(dot []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Fix dot bug related to unquoted amperands.
+	// Fix dot bug related to unquoted ampersands.
 	svg := bytes.Replace(out.Bytes(), []byte("&;"), []byte("&amp;;"), -1)
 
 	// Cleanup for embedding by dropping stuff before the <svg> start.

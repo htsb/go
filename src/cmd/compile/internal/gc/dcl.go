@@ -60,10 +60,6 @@ var declare_typegen int
 // declare records that Node n declares symbol n.Sym in the specified
 // declaration context.
 func declare(n *Node, ctxt Class) {
-	if ctxt == PDISCARD {
-		return
-	}
-
 	if n.isBlank() {
 		return
 	}
@@ -94,7 +90,7 @@ func declare(n *Node, ctxt Class) {
 			lineno = n.Pos
 			Fatalf("automatic outside function")
 		}
-		if Curfn != nil {
+		if Curfn != nil && ctxt != PFUNC {
 			Curfn.Func.Dcl = append(Curfn.Func.Dcl, n)
 		}
 		if n.Op == OTYPE {
@@ -166,11 +162,12 @@ func variter(vl []*Node, t *Node, el []*Node) []*Node {
 		return append(init, as2)
 	}
 
+	nel := len(el)
 	for _, v := range vl {
 		var e *Node
 		if doexpr {
 			if len(el) == 0 {
-				yyerror("missing expression in var declaration")
+				yyerror("assignment mismatch: %d variables but %d values", len(vl), nel)
 				break
 			}
 			e = el[0]
@@ -194,7 +191,7 @@ func variter(vl []*Node, t *Node, el []*Node) []*Node {
 	}
 
 	if len(el) != 0 {
-		yyerror("extra expression in var declaration")
+		yyerror("assignment mismatch: %d variables but %d values", len(vl), nel)
 	}
 	return init
 }
@@ -206,7 +203,6 @@ func newnoname(s *types.Sym) *Node {
 	}
 	n := nod(ONONAME, nil, nil)
 	n.Sym = s
-	n.SetAddable(true)
 	n.Xoffset = 0
 	return n
 }
@@ -282,10 +278,9 @@ func oldname(s *types.Sym) *Node {
 			// Do not have a closure var for the active closure yet; make one.
 			c = newname(s)
 			c.SetClass(PAUTOHEAP)
-			c.SetIsClosureVar(true)
+			c.Name.SetIsClosureVar(true)
 			c.SetIsDDD(n.IsDDD())
 			c.Name.Defn = n
-			c.SetAddable(false)
 
 			// Link into list of active closure variables.
 			// Popped from list in func closurebody.
@@ -299,6 +294,16 @@ func oldname(s *types.Sym) *Node {
 		return c
 	}
 
+	return n
+}
+
+// importName is like oldname, but it reports an error if sym is from another package and not exported.
+func importName(sym *types.Sym) *Node {
+	n := oldname(sym)
+	if !types.IsExported(sym.Name) && sym.Pkg != localpkg {
+		n.SetDiag(true)
+		yyerror("cannot refer to unexported name %s.%s", sym.Pkg.Name, sym.Name)
+	}
 	return n
 }
 
@@ -543,7 +548,7 @@ func structfield(n *Node) *types.Field {
 	f.Sym = n.Sym
 
 	if n.Left != nil {
-		n.Left = typecheck(n.Left, Etype)
+		n.Left = typecheck(n.Left, ctxType)
 		n.Type = n.Left.Type
 		n.Left = nil
 	}
@@ -575,10 +580,10 @@ func structfield(n *Node) *types.Field {
 
 // checkdupfields emits errors for duplicately named fields or methods in
 // a list of struct or interface types.
-func checkdupfields(what string, ts ...*types.Type) {
+func checkdupfields(what string, fss ...[]*types.Field) {
 	seen := make(map[*types.Sym]bool)
-	for _, t := range ts {
-		for _, f := range t.Fields().Slice() {
+	for _, fs := range fss {
+		for _, f := range fs {
 			if f.Sym == nil || f.Sym.IsBlank() {
 				continue
 			}
@@ -595,14 +600,6 @@ func checkdupfields(what string, ts ...*types.Type) {
 // a type for struct/interface/arglist
 func tostruct(l []*Node) *types.Type {
 	t := types.New(TSTRUCT)
-	tostruct0(t, l)
-	return t
-}
-
-func tostruct0(t *types.Type, l []*Node) {
-	if t == nil || !t.IsStruct() {
-		Fatalf("struct expected")
-	}
 
 	fields := make([]*types.Field, len(l))
 	for i, n := range l {
@@ -614,11 +611,13 @@ func tostruct0(t *types.Type, l []*Node) {
 	}
 	t.SetFields(fields)
 
-	checkdupfields("field", t)
+	checkdupfields("field", t.FieldSlice())
 
 	if !t.Broke() {
 		checkwidth(t)
 	}
+
+	return t
 }
 
 func tofunargs(l []*Node, funarg types.Funarg) *types.Type {
@@ -667,7 +666,7 @@ func interfacefield(n *Node) *types.Field {
 	// Otherwise, Left is InterfaceTypeName.
 
 	if n.Left != nil {
-		n.Left = typecheck(n.Left, Etype)
+		n.Left = typecheck(n.Left, ctxType)
 		n.Type = n.Left.Type
 		n.Left = nil
 	}
@@ -689,15 +688,6 @@ func tointerface(l []*Node) *types.Type {
 		return types.Types[TINTER]
 	}
 	t := types.New(TINTER)
-	tointerface0(t, l)
-	return t
-}
-
-func tointerface0(t *types.Type, l []*Node) {
-	if t == nil || !t.IsInterface() {
-		Fatalf("interface expected")
-	}
-
 	var fields []*types.Field
 	for _, n := range l {
 		f := interfacefield(n)
@@ -707,6 +697,7 @@ func tointerface0(t *types.Type, l []*Node) {
 		fields = append(fields, f)
 	}
 	t.SetInterface(fields)
+	return t
 }
 
 func fakeRecv() *Node {
@@ -729,14 +720,6 @@ func isifacemethod(f *types.Type) bool {
 // turn a parsed function declaration into a type
 func functype(this *Node, in, out []*Node) *types.Type {
 	t := types.New(TFUNC)
-	functype0(t, this, in, out)
-	return t
-}
-
-func functype0(t *types.Type, this *Node, in, out []*Node) {
-	if t == nil || t.Etype != TFUNC {
-		Fatalf("function type expected")
-	}
 
 	var rcvr []*Node
 	if this != nil {
@@ -746,22 +729,20 @@ func functype0(t *types.Type, this *Node, in, out []*Node) {
 	t.FuncType().Params = tofunargs(in, types.FunargParams)
 	t.FuncType().Results = tofunargs(out, types.FunargResults)
 
-	checkdupfields("argument", t.Recvs(), t.Params(), t.Results())
+	checkdupfields("argument", t.Recvs().FieldSlice(), t.Params().FieldSlice(), t.Results().FieldSlice())
 
 	if t.Recvs().Broke() || t.Results().Broke() || t.Params().Broke() {
 		t.SetBroke(true)
 	}
 
 	t.FuncType().Outnamed = t.NumResults() > 0 && origSym(t.Results().Field(0).Sym) != nil
+
+	return t
 }
 
 func functypefield(this *types.Field, in, out []*types.Field) *types.Type {
 	t := types.New(TFUNC)
-	functypefield0(t, this, in, out)
-	return t
-}
 
-func functypefield0(t *types.Type, this *types.Field, in, out []*types.Field) {
 	var rcvr []*types.Field
 	if this != nil {
 		rcvr = []*types.Field{this}
@@ -771,6 +752,8 @@ func functypefield0(t *types.Type, this *types.Field, in, out []*types.Field) {
 	t.FuncType().Results = tofunargsfield(out, types.FunargResults)
 
 	t.FuncType().Outnamed = t.NumResults() > 0 && origSym(t.Results().Field(0).Sym) != nil
+
+	return t
 }
 
 // origSym returns the original symbol written by the user.
@@ -1002,10 +985,14 @@ func makefuncsym(s *types.Sym) {
 	}
 }
 
-// disableExport prevents sym from being included in package export
-// data. To be effectual, it must be called before declare.
-func disableExport(sym *types.Sym) {
-	sym.SetOnExportList(true)
+// setNodeNameFunc marks a node as a function.
+func setNodeNameFunc(n *Node) {
+	if n.Op != ONAME || n.Class() != Pxxx {
+		Fatalf("expected ONAME/Pxxx node, got %v", n)
+	}
+
+	n.SetClass(PFUNC)
+	n.Sym.SetFunc(true)
 }
 
 func dclfunc(sym *types.Sym, tfn *Node) *Node {
@@ -1017,9 +1004,9 @@ func dclfunc(sym *types.Sym, tfn *Node) *Node {
 	fn.Func.Nname = newfuncnamel(lineno, sym)
 	fn.Func.Nname.Name.Defn = fn
 	fn.Func.Nname.Name.Param.Ntype = tfn
-	declare(fn.Func.Nname, PFUNC)
+	setNodeNameFunc(fn.Func.Nname)
 	funchdr(fn)
-	fn.Func.Nname.Name.Param.Ntype = typecheck(fn.Func.Nname.Name.Param.Ntype, Etype)
+	fn.Func.Nname.Name.Param.Ntype = typecheck(fn.Func.Nname.Name.Param.Ntype, ctxType)
 	return fn
 }
 
